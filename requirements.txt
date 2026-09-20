@@ -1,0 +1,25 @@
+# Core Web Frameworks
+django>=5.0.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+python-multipart>=0.0.12
+pydantic>=2.8.0
+
+# Deep Learning & Computer Vision
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.44.0
+sentence-transformers>=3.1.0
+ultralytics>=8.3.0
+opencv-python>=4.8.0
+pillow>=10.4.0
+numpy>=1.24.0
+
+# Vector Database & Storage
+qdrant-client>=1.11.0
+portalocker>=2.8.0
+
+# Data Science & Utilities
+pandas>=2.2.0
+kagglehub>=0.3.0
+requests>=2.31.0
