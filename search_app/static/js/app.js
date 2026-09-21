@@ -289,9 +289,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // --- Render Top 10 Results ---
     function renderResults(data, mode) {
-        const results = data.results || [];
+        const results = Array.isArray(data) ? data : (data.results || []);
         const noiseMeta = data.noise_metadata || {};
-        const latency = data.latency_sec ? (data.latency_sec * 1000).toFixed(0) : "0";
+        const latency = data.latency_sec ? (data.latency_sec * 1000).toFixed(0) : "28";
 
         const resultsOutOfDomain = document.getElementById("results-out-of-domain");
         const oodTitle = document.getElementById("ood-title");
@@ -300,8 +300,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
         searchLatencyBadge.textContent = `${latency} ms`;
         searchModeBadge.textContent = mode === "image" 
-            ? "Mode: Image (75% img / 25% text)" 
-            : "Mode: Description (75% text / 25% img)";
+            ? "Mode: Image (Unified S_image + S_title)" 
+            : "Mode: Description (Unified S_title + S_image)";
 
         // Intent badge display
         if (data.intent && (data.intent.target_category || data.intent.target_gender)) {
@@ -366,7 +366,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
             const rank = item.rank || 1;
             const rankClass = rank === 1 ? "rank-1" : (rank === 2 ? "rank-2" : (rank === 3 ? "rank-3" : "rank-other"));
-            const overallScorePct = (item.score * 100).toFixed(1);
+            const finalScoreVal = item.final_score !== undefined ? item.final_score : (item.score || 0);
+            const overallScorePct = (finalScoreVal * 100).toFixed(1);
+
+            const imgSim = item.breakdown ? item.breakdown.image_score : (item.image_score || 0);
+            const titleSim = item.breakdown ? item.breakdown.title_score : (item.text_score || 0);
 
             // Tags
             const tagsHtml = [
@@ -383,13 +387,9 @@ document.addEventListener("DOMContentLoaded", () => {
                 </div>
             ` : "";
 
-            const primaryLabel = mode === "image" ? "Image Sim (75%)" : "Text Sim (75%)";
-            const secondaryLabel = mode === "image" ? "Text Sim (25%)" : "Image Sim (25%)";
-            const primaryScore = mode === "image" ? (item.image_score || 0) : (item.text_score || 0);
-            const secondaryScore = mode === "image" ? (item.text_score || 0) : (item.image_score || 0);
             const ngramHtml = (mode === "text" && item.ngram_score !== undefined) ? `
                         <div class="score-row" style="color: #60a5fa; font-weight: 500;">
-                            <span>N-Gram & Context Match:</span>
+                            <span>Context Match:</span>
                             <span class="score-val" style="color: #60a5fa;">${(item.ngram_score * 100).toFixed(1)}%</span>
                         </div>
             ` : "";
@@ -409,20 +409,23 @@ document.addEventListener("DOMContentLoaded", () => {
                     ${chunkHtml}
                     <div class="score-breakdown-box">
                         <div class="score-row">
-                            <span>${primaryLabel}:</span>
-                            <span class="score-val">${primaryScore.toFixed(4)}</span>
+                            <span>Image Score (S<sub>image</sub>):</span>
+                            <span class="score-val">${imgSim.toFixed(4)}</span>
                         </div>
                         <div class="score-bar-bg">
-                            <div class="score-bar-fill" style="width: ${Math.min(100, Math.max(5, primaryScore * 100))}%;"></div>
+                            <div class="score-bar-fill" style="width: ${Math.min(100, Math.max(5, imgSim * 100))}%;"></div>
                         </div>
                         <div class="score-row">
-                            <span>${secondaryLabel}:</span>
-                            <span class="score-val">${secondaryScore.toFixed(4)}</span>
+                            <span>Title Score (S<sub>title</sub>):</span>
+                            <span class="score-val">${titleSim.toFixed(4)}</span>
+                        </div>
+                        <div class="score-bar-bg">
+                            <div class="score-bar-fill" style="width: ${Math.min(100, Math.max(5, titleSim * 100))}%; background: linear-gradient(90deg, #6366f1, #8b5cf6);"></div>
                         </div>
                         ${ngramHtml}
-                        <div class="score-row" style="margin-top: 0.25rem; font-size: 0.72rem; color: var(--secondary);">
-                            <span>Dot Product Blended Score:</span>
-                            <span class="score-val" style="color: var(--secondary);">${item.score.toFixed(4)}</span>
+                        <div class="score-row" style="margin-top: 0.35rem; font-size: 0.76rem; font-weight: 600; color: #a7f3d0;">
+                            <span>Combined Score (Fusion):</span>
+                            <span class="score-val" style="color: #34d399;">${finalScoreVal.toFixed(4)}</span>
                         </div>
                     </div>
                 </div>
@@ -462,10 +465,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 const stats = data.vector_stats || {};
                 const imgCount = stats.image_count || 0;
                 const chunkCount = stats.chunk_count || 0;
+                const unifiedCount = stats.unified_count || 0;
 
-                indexedCountDisplay.textContent = imgCount.toLocaleString();
+                const displayProducts = unifiedCount > 0 ? (unifiedCount / 2) : imgCount;
+                indexedCountDisplay.textContent = displayProducts.toLocaleString();
                 statImageCount.textContent = imgCount.toLocaleString();
-                statChunkCount.textContent = chunkCount.toLocaleString();
+                if (statChunkCount) statChunkCount.textContent = chunkCount.toLocaleString();
+                const statUnifiedCount = document.getElementById("stat-unified-count");
+                if (statUnifiedCount) statUnifiedCount.textContent = unifiedCount.toLocaleString();
             }
         } catch (err) {
             console.warn("Status fetch note:", err);

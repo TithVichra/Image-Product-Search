@@ -106,22 +106,19 @@ class ObjectDetector:
                     "is_selected": False
                 })
 
-        # Non-fashion COCO classes (animals, vehicles, foods, sports equipment, appliances, etc.)
+        # Unambiguous non-fashion COCO classes (strictly animals, vehicles, infrastructure)
+        # Note: Do NOT include classes like 'clock' (watches), 'cake'/'sandwich' (textured shoes/bags),
+        # 'vase' (bottles/perfumes), 'book' (wallets), 'scissors' (sunglasses), or 'sports ball' (caps/sportswear)
         NON_FASHION_CLASSES = {
             "dog", "cat", "bird", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
-            "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
-            "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
-            "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake",
-            "sports ball", "baseball bat", "baseball glove", "tennis racket", "frisbee", "skateboard", "surfboard", "skis", "snowboard", "kite",
-            "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote",
-            "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock",
-            "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
+            "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+            "traffic light", "fire hydrant", "stop sign", "parking meter", "toilet"
         }
         FASHION_CLASSES = {"backpack", "umbrella", "handbag", "tie", "suitcase"}
         PERSON_CLASSES = {"person"}
 
-        # Check for out-of-domain entities detected by YOLO
-        detected_non_fashion = [b for b in detected_boxes if b["class_name"].lower() in NON_FASHION_CLASSES and b["confidence"] >= 0.35]
+        # Check for out-of-domain entities detected by YOLO (require high confidence >= 0.65)
+        detected_non_fashion = [b for b in detected_boxes if b["class_name"].lower() in NON_FASHION_CLASSES and b["confidence"] >= 0.65]
         detected_fashion = [b for b in detected_boxes if b["class_name"].lower() in FASHION_CLASSES]
         detected_person = [b for b in detected_boxes if b["class_name"].lower() in PERSON_CLASSES]
 

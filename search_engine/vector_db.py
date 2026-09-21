@@ -13,6 +13,7 @@ from .scoring import blend_scores, eliminate_rank_gap_noise, compute_ngram_conte
 
 COLLECTION_IMAGES = "fashion_products_image"
 COLLECTION_CHUNKS = "fashion_products_text_chunks"
+COLLECTION_UNIFIED = "fashion_unified_vectors"
 VECTOR_DIM = 512
 
 _vector_db_instance = None
@@ -51,19 +52,23 @@ class VectorDB:
             )
             print(f"[VectorDB] Created collection '{COLLECTION_CHUNKS}' with Distance.DOT")
 
+        if COLLECTION_UNIFIED not in existing:
+            self.client.create_collection(
+                collection_name=COLLECTION_UNIFIED,
+                vectors_config=models.VectorParams(size=VECTOR_DIM, distance=models.Distance.DOT)
+            )
+            print(f"[VectorDB] Created single unified collection '{COLLECTION_UNIFIED}' with Distance.DOT")
+
     def reset_collections(self):
         """
         Clears and recreates collections for fresh dataset indexing.
         """
         print("[VectorDB] Resetting collections for fresh Kaggle dataset indexing...")
-        try:
-            self.client.delete_collection(COLLECTION_IMAGES)
-        except Exception:
-            pass
-        try:
-            self.client.delete_collection(COLLECTION_CHUNKS)
-        except Exception:
-            pass
+        for col in [COLLECTION_IMAGES, COLLECTION_CHUNKS, COLLECTION_UNIFIED]:
+            try:
+                self.client.delete_collection(col)
+            except Exception:
+                pass
         self._init_collections()
 
     def upsert_products_batch(
@@ -371,20 +376,299 @@ class VectorDB:
             "is_out_of_domain": False
         }
 
+    def upsert_unified_batch(
+        self,
+        products_data: List[Dict[str, Any]],
+        image_embeddings: np.ndarray,
+        title_embeddings: np.ndarray
+    ):
+        """
+        Upserts a batch of products into the single unified vector collection:
+        COLLECTION_UNIFIED = 'fashion_unified_vectors'.
+        Each product produces two vector points in the single vector column/collection:
+        1. Product Image vector tagged with embedding_type='image'
+        2. Product Title vector tagged with embedding_type='title'
+        Both vectors reside in the same collection and dimension space (512, unit normalized).
+        """
+        points = []
+        for i, prod in enumerate(products_data):
+            pid = int(prod["id"])
+            pname = prod.get("productDisplayName") or prod.get("name", f"Product #{pid}")
+            img_url = prod.get("image_url", f"/media/images/{pid}.jpg")
+
+            base_meta = {
+                "product_id": pid,
+                "name": pname,
+                "productDisplayName": pname,
+                "image_url": img_url,
+                "gender": prod.get("gender", ""),
+                "masterCategory": prod.get("masterCategory", ""),
+                "subCategory": prod.get("subCategory", ""),
+                "articleType": prod.get("articleType", ""),
+                "baseColour": prod.get("baseColour", ""),
+                "season": prod.get("season", ""),
+                "usage": prod.get("usage", ""),
+            }
+
+            # 1. Product Image vector entry
+            img_vec = image_embeddings[i].tolist()
+            img_payload = dict(base_meta)
+            img_payload["embedding_type"] = "image"
+            points.append(
+                models.PointStruct(
+                    id=pid * 2,
+                    vector=img_vec,
+                    payload=img_payload
+                )
+            )
+
+            # 2. Product Title vector entry
+            title_vec = title_embeddings[i].tolist()
+            title_payload = dict(base_meta)
+            title_payload["embedding_type"] = "title"
+            points.append(
+                models.PointStruct(
+                    id=pid * 2 + 1,
+                    vector=title_vec,
+                    payload=title_payload
+                )
+            )
+
+        if points:
+            self.client.upsert(collection_name=COLLECTION_UNIFIED, points=points)
+
+    def unified_search(
+        self,
+        query_vector: np.ndarray,
+        search_mode: str = "text",
+        top_k: int = 10,
+        candidate_pool: int = 100,
+        fusion_strategy: str = "weighted_sum",
+        weights: Optional[Tuple[float, float]] = None,
+        fetch_missing_counterpart: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Implements Task 3 Combining & Reranking Pipeline on the Unified Vector Table:
+        1. Encodes user query into shared CLIP latent space (512-d unit vector).
+        2. Retrieves candidate matches from the unified collection.
+        3. Groups candidate hits by product_id to aggregate modality scores:
+           S_image = sim(query, item_image)
+           S_title = sim(query, item_title)
+        4. Applies a combining/reranking strategy (Weighted Sum / Score Fusion / RRF).
+        5. Selects and returns the top 10 unique ranked items.
+        """
+        query_list = query_vector.tolist()
+        pool_size = max(candidate_pool, top_k * 8)
+
+        # Retrieve candidate points from the single unified collection
+        hits = self.client.query_points(
+            collection_name=COLLECTION_UNIFIED,
+            query=query_list,
+            limit=pool_size,
+            with_payload=True
+        ).points
+
+        # Also retrieve from catalog image collection to guarantee full coverage of all indexed products
+        img_coll_hits = []
+        try:
+            img_coll_hits = self.client.query_points(
+                collection_name=COLLECTION_IMAGES,
+                query=query_list,
+                limit=pool_size,
+                with_payload=True
+            ).points
+        except Exception:
+            pass
+
+        if not hits and not img_coll_hits:
+            return []
+
+        # Group retrieved hits by product_id
+        grouped: Dict[int, Dict[str, Any]] = {}
+        for rank_idx, pt in enumerate(hits):
+            payload = pt.payload or {}
+            pid = int(payload.get("product_id", pt.id // 2))
+            emb_type = payload.get("embedding_type", "image" if pt.id % 2 == 0 else "title")
+            score = float(pt.score)
+
+            if pid not in grouped:
+                grouped[pid] = {
+                    "product_id": pid,
+                    "name": payload.get("name") or payload.get("productDisplayName", f"Product #{pid}"),
+                    "image_url": payload.get("image_url", f"/media/images/{pid}.jpg"),
+                    "gender": payload.get("gender", ""),
+                    "masterCategory": payload.get("masterCategory", ""),
+                    "subCategory": payload.get("subCategory", ""),
+                    "articleType": payload.get("articleType", ""),
+                    "baseColour": payload.get("baseColour", ""),
+                    "season": payload.get("season", ""),
+                    "usage": payload.get("usage", ""),
+                    "image_score": None,
+                    "title_score": None,
+                    "image_rank": None,
+                    "title_rank": None
+                }
+
+            if emb_type == "image":
+                if grouped[pid]["image_score"] is None or score > grouped[pid]["image_score"]:
+                    grouped[pid]["image_score"] = score
+                    grouped[pid]["image_rank"] = rank_idx + 1
+            elif emb_type == "title":
+                if grouped[pid]["title_score"] is None or score > grouped[pid]["title_score"]:
+                    grouped[pid]["title_score"] = score
+                    grouped[pid]["title_rank"] = rank_idx + 1
+
+        # Incorporate hits from image collection
+        for rank_idx, pt in enumerate(img_coll_hits):
+            payload = pt.payload or {}
+            pid = int(pt.id)
+            score = float(pt.score)
+
+            if pid not in grouped:
+                grouped[pid] = {
+                    "product_id": pid,
+                    "name": payload.get("name") or payload.get("productDisplayName", f"Product #{pid}"),
+                    "image_url": payload.get("image_url", f"/media/images/{pid}.jpg"),
+                    "gender": payload.get("gender", ""),
+                    "masterCategory": payload.get("masterCategory", ""),
+                    "subCategory": payload.get("subCategory", ""),
+                    "articleType": payload.get("articleType", ""),
+                    "baseColour": payload.get("baseColour", ""),
+                    "season": payload.get("season", ""),
+                    "usage": payload.get("usage", ""),
+                    "image_score": score,
+                    "title_score": None,
+                    "image_rank": rank_idx + 1,
+                    "title_rank": None
+                }
+            else:
+                if grouped[pid]["image_score"] is None or score > grouped[pid]["image_score"]:
+                    grouped[pid]["image_score"] = score
+                    if grouped[pid]["image_rank"] is None:
+                        grouped[pid]["image_rank"] = rank_idx + 1
+
+        # Optionally retrieve the counterpart vector for products that only appeared in one modality
+        if fetch_missing_counterpart:
+            missing_ids = []
+            for pid, cand in grouped.items():
+                if cand["image_score"] is None:
+                    missing_ids.append(pid * 2)
+                if cand["title_score"] is None:
+                    missing_ids.append(pid * 2 + 1)
+
+            if missing_ids:
+                try:
+                    counterparts = self.client.retrieve(
+                        collection_name=COLLECTION_UNIFIED,
+                        ids=missing_ids,
+                        with_vectors=True
+                    )
+                    for cpt in counterparts:
+                        if cpt.vector is not None:
+                            c_vec = np.array(cpt.vector, dtype=np.float32)
+                            cos_sim = float(np.dot(query_vector, c_vec))
+                            c_pid = int(cpt.payload.get("product_id", cpt.id // 2))
+                            c_type = cpt.payload.get("embedding_type", "image" if cpt.id % 2 == 0 else "title")
+                            if c_pid in grouped:
+                                if c_type == "image" and grouped[c_pid]["image_score"] is None:
+                                    grouped[c_pid]["image_score"] = cos_sim
+                                elif c_type == "title" and grouped[c_pid]["title_score"] is None:
+                                    grouped[c_pid]["title_score"] = cos_sim
+                except Exception as e:
+                    print(f"[VectorDB] Counterpart lookup note: {e}")
+
+        # Fill default scores if any remain unpopulated
+        for cand in grouped.values():
+            if cand["image_score"] is None:
+                cand["image_score"] = 0.0
+            if cand["title_score"] is None:
+                cand["title_score"] = 0.0
+
+        # Weights configuration
+        if weights is None:
+            if search_mode == "image":
+                w_img, w_title = 0.85, 0.15
+            else:
+                w_img, w_title = 0.25, 0.75
+        else:
+            w_img, w_title = weights
+
+        # Apply combining strategy
+        ranked_products = []
+        for cand in grouped.values():
+            s_img = cand["image_score"]
+            s_title = cand["title_score"]
+
+            if fusion_strategy == "rrf":
+                # Reciprocal Rank Fusion (k=60)
+                r_img = cand["image_rank"] if cand["image_rank"] is not None else (pool_size + 1)
+                r_title = cand["title_rank"] if cand["title_rank"] is not None else (pool_size + 1)
+                final_score = (1.0 / (60.0 + r_img)) + (1.0 / (60.0 + r_title))
+            elif fusion_strategy == "score_fusion":
+                # Average score fusion
+                final_score = 0.5 * (s_img + s_title)
+            else:
+                # Weighted sum fusion (default)
+                if search_mode == "image" and s_img >= 0.95:
+                    # Near-identical or exact catalog image match prioritizes visual fidelity
+                    final_score = s_img if s_title == 0.0 else (0.95 * s_img + 0.05 * s_title)
+                else:
+                    final_score = (w_img * s_img) + (w_title * s_title)
+
+            ranked_products.append({
+                "product_id": cand["product_id"],
+                "id": cand["product_id"],
+                "name": cand["name"],
+                "display_name": cand["name"],
+                "image_url": cand["image_url"],
+                "final_score": round(float(final_score), 4),
+                "score": round(float(final_score), 4),
+                "breakdown": {
+                    "image_score": round(float(s_img), 4),
+                    "title_score": round(float(s_title), 4)
+                },
+                "image_score": round(float(s_img), 4),
+                "text_score": round(float(s_title), 4),
+                "gender": cand["gender"],
+                "masterCategory": cand["masterCategory"],
+                "subCategory": cand["subCategory"],
+                "articleType": cand["articleType"],
+                "baseColour": cand["baseColour"],
+                "season": cand["season"],
+                "usage": cand["usage"]
+            })
+
+        # Sort descending by final_score
+        ranked_products.sort(key=lambda x: x["final_score"], reverse=True)
+
+        # Deliver the top_k unique products with 1-based rank
+        final_top = ranked_products[:top_k]
+        for idx, item in enumerate(final_top):
+            item["rank"] = idx + 1
+
+        return final_top
+
     def get_stats(self) -> Dict[str, Any]:
         """
-        Returns count of items in both collections.
+        Returns count of items in all collections.
         """
         try:
             img_count = self.client.count(collection_name=COLLECTION_IMAGES).count
-            chunk_count = self.client.count(collection_name=COLLECTION_CHUNKS).count
-        except Exception as e:
+        except Exception:
             img_count = 0
+        try:
+            chunk_count = self.client.count(collection_name=COLLECTION_CHUNKS).count
+        except Exception:
             chunk_count = 0
+        try:
+            unified_count = self.client.count(collection_name=COLLECTION_UNIFIED).count
+        except Exception:
+            unified_count = 0
             
         return {
             "image_count": img_count,
             "chunk_count": chunk_count,
+            "unified_count": unified_count,
             "storage_path": self.storage_path
         }
 
@@ -394,3 +678,4 @@ def get_vector_db() -> VectorDB:
     if _vector_db_instance is None:
         _vector_db_instance = VectorDB()
     return _vector_db_instance
+

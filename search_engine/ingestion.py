@@ -102,8 +102,25 @@ class DatasetIngestion:
                 pid = row.get("id")
                 if not pid:
                     continue
+
+                # Clean and standardize productDisplayName as primary title field
+                raw_title = row.get("productDisplayName") or ""
+                clean_title = " ".join(raw_title.strip().split())
+                if not clean_title:
+                    # Drop records with empty title fields (Task 1)
+                    continue
+
                 img_path = os.path.join(images_dir, f"{pid}.jpg")
                 if not os.path.exists(img_path):
+                    # Drop records with missing image files (Task 1)
+                    continue
+
+                # Validate image readability (Task 1)
+                try:
+                    with Image.open(img_path) as test_img:
+                        test_img.verify()
+                except Exception:
+                    # Drop unreadable image assets
                     continue
 
                 # Copy/symlink image to media_images_dir for web serving
@@ -111,7 +128,7 @@ class DatasetIngestion:
                 if not os.path.exists(dest_img):
                     try:
                         shutil.copyfile(img_path, dest_img)
-                    except Exception as e:
+                    except Exception:
                         pass
 
                 # Check for styles json if available
@@ -129,11 +146,12 @@ class DatasetIngestion:
                         pass
 
                 row["description"] = desc_text
-                row["name"] = row.get("productDisplayName", f"Product #{pid}")
-                row["image_path"] = dest_img
+                row["productDisplayName"] = clean_title
+                row["name"] = clean_title
+                row["image_path"] = dest_img if os.path.exists(dest_img) else img_path
                 row["image_url"] = f"/media/images/{pid}.jpg"
                 
-                # Pre-generate chunks
+                # Pre-generate chunks for backward compatibility
                 row["chunks"] = chunk_product_description(row)
                 products.append(row)
 
@@ -141,7 +159,7 @@ class DatasetIngestion:
                     break
 
         total_products = len(products)
-        print(f"[Ingestion] Loaded {total_products} valid products to index.")
+        print(f"[Ingestion] Loaded {total_products} validated products to index.")
 
         indexed_count = 0
         for i in range(0, total_products, batch_size):
@@ -156,10 +174,21 @@ class DatasetIngestion:
                     img = Image.new("RGB", (224, 224), color="gray")
                 batch_images.append(img)
 
-            # 1. Encode images with CLIP in batch
+            # 1. Encode catalog images via CLIP Vision Transformer (Task 2)
             batch_img_vecs = clip_service.encode_images(batch_images, batch_size=batch_size)
 
-            # 2. Encode all description chunks for batch
+            # 2. Encode productDisplayName via CLIP Text Transformer (Task 2)
+            batch_titles = [p["name"] for p in batch_prods]
+            batch_title_vecs = clip_service.encode_texts(batch_titles, batch_size=batch_size)
+
+            # 3. Store inside single unified vector collection tagged by embedding type (Task 2)
+            vector_db.upsert_unified_batch(
+                products_data=batch_prods,
+                image_embeddings=batch_img_vecs,
+                title_embeddings=batch_title_vecs
+            )
+
+            # 4. Encode description chunks and maintain dual-collection compatibility
             chunk_map = {}
             for p in batch_prods:
                 pid = int(p["id"])
@@ -169,7 +198,6 @@ class DatasetIngestion:
                     chunk_vecs = clip_service.encode_texts(chunk_texts, batch_size=batch_size)
                     chunk_map[pid] = chunk_vecs
 
-            # 3. Upsert into Qdrant
             vector_db.upsert_products_batch(
                 products_data=batch_prods,
                 image_embeddings=batch_img_vecs,

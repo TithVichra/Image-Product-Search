@@ -67,6 +67,76 @@ def get_status():
     }
 
 
+class SearchTextContractRequest(BaseModel):
+    query: str
+    top_k: int = 10
+
+
+@fastapi_app.post("/search/text")
+def search_text_unified_contract(req: SearchTextContractRequest):
+    """
+    Task 4 Required Endpoint:
+    POST /search/text: Accepts {"query": "navy blue sports shoes", "top_k": 10}.
+    Delivers top 10 unique items with product_id, name, image_url, final_score, and breakdown.
+    """
+    clean_q = req.query.strip() if req.query else ""
+    if not clean_q:
+        raise HTTPException(status_code=400, detail="Query string cannot be empty.")
+
+    from search_engine.clip_service import get_clip_service
+    from search_engine.vector_db import get_vector_db
+
+    clip_service = get_clip_service()
+    vector_db = get_vector_db()
+
+    query_vec = clip_service.encode_text_single(clean_q)
+    return vector_db.unified_search(
+        query_vector=query_vec,
+        search_mode="text",
+        top_k=req.top_k,
+        candidate_pool=100
+    )
+
+
+@fastapi_app.post("/search/image")
+async def search_image_unified_contract(
+    file: UploadFile = File(...),
+    top_k: int = Form(10)
+):
+    """
+    Task 4 Required Endpoint:
+    POST /search/image: Accepts multipart/form-data image file upload.
+    Delivers top 10 unique items with product_id, name, image_url, final_score, and breakdown.
+    """
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
+
+    content = await file.read()
+    try:
+        image = Image.open(io.BytesIO(content)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image format: {e}")
+
+    file_id = str(uuid.uuid4())[:8]
+    raw_filename = f"query_{file_id}.jpg"
+    raw_path = os.path.join(UPLOADS_DIR, raw_filename)
+    image.save(raw_path, "JPEG")
+
+    from search_engine.clip_service import get_clip_service
+    from search_engine.vector_db import get_vector_db
+
+    clip_service = get_clip_service()
+    vector_db = get_vector_db()
+
+    query_vec = clip_service.encode_image_single(image)
+    return vector_db.unified_search(
+        query_vector=query_vec,
+        search_mode="image",
+        top_k=top_k,
+        candidate_pool=100
+    )
+
+
 @fastapi_app.post("/api/search/text")
 def search_by_text(req: TextSearchRequest):
     if not req.query or not req.query.strip():
@@ -171,41 +241,122 @@ async def search_by_image(
     detector = get_detector()
     det_res = detector.detect_and_crop(image, target_box_index=box_index)
 
-    # Choose image for embedding: cropped/focused object if use_crop is enabled
-    if use_crop and det_res["crop_applied"]:
-        target_img = det_res["cropped_image"]
-    else:
-        target_img = image
-
-    # Save crop preview
+    # Save cropped image preview
     crop_filename = f"crop_{file_id}.jpg"
     crop_path = os.path.join(CROPS_DIR, crop_filename)
-    target_img.save(crop_path, "JPEG")
+    det_res["cropped_image"].save(crop_path, "JPEG")
 
-    # Encode with CLIP
     clip_service = get_clip_service()
-    query_vec = clip_service.encode_image_single(target_img)
-
-    # Search Qdrant with search_mode="image" (75% image score, 25% text score)
     vector_db = get_vector_db()
-    search_res = vector_db.search(
-        query_vector=query_vec,
+
+    # 1. Always encode uncropped original image vector
+    orig_vec = clip_service.encode_image_single(image)
+    orig_results = vector_db.unified_search(
+        query_vector=orig_vec,
         search_mode="image",
-        top_candidates=50,
-        gap_threshold=gap_threshold,
-        max_results=max_results,
-        eliminate_noise=eliminate_noise
+        top_k=max_results,
+        candidate_pool=100
     )
 
+    # 2. Check if cropping should be tested
+    crop_results = None
+    if use_crop and det_res["crop_applied"]:
+        crop_vec = clip_service.encode_image_single(det_res["cropped_image"])
+        crop_results = vector_db.unified_search(
+            query_vector=crop_vec,
+            search_mode="image",
+            top_k=max_results,
+            candidate_pool=100
+        )
+
+    # Compare uncropped vs cropped results
+    orig_top_sim = orig_results[0]["breakdown"]["image_score"] if orig_results else 0.0
+    crop_top_sim = crop_results[0]["breakdown"]["image_score"] if crop_results else 0.0
+
+    # If original image has high match similarity (>= 0.65) or beats cropped image, preserve original
+    if crop_results is None or orig_top_sim >= 0.65 or orig_top_sim >= crop_top_sim:
+        final_results = orig_results
+        selected_top_sim = orig_top_sim
+    else:
+        final_results = crop_results
+        selected_top_sim = crop_top_sim
+
+    # 3. Domain validation: An image that matches a product with similarity >= 0.80 is confirmed in-domain!
+    is_out_of_domain = False
+    domain_reason = None
+
+    if selected_top_sim < 0.80:
+        if det_res.get("is_out_of_domain"):
+            is_out_of_domain = True
+            domain_reason = det_res.get("out_of_domain_reason")
+        else:
+            domain_check = clip_service.classify_domain(image)
+            if domain_check.get("is_out_of_domain"):
+                is_out_of_domain = True
+                domain_reason = domain_check.get("out_of_domain_reason")
+
     elapsed = round(time.time() - t0, 3)
-    search_res["query_image_url"] = f"/media/uploads/{raw_filename}"
-    search_res["crop_image_url"] = f"/media/crops/{crop_filename}"
-    search_res["detected_boxes"] = det_res["detected_boxes"]
-    search_res["crop_applied"] = det_res["crop_applied"]
-    search_res["crop_box"] = det_res["crop_box"]
-    search_res["dimensions"] = det_res["dimensions"]
-    search_res["latency_sec"] = elapsed
-    return search_res
+
+    if is_out_of_domain or not final_results:
+        return {
+            "results": [],
+            "noise_metadata": {
+                "total_candidates": 0,
+                "kept_count": 0,
+                "eliminated_count": 0,
+                "reason": "out_of_domain" if is_out_of_domain else "no_matches",
+                "details": domain_reason or "No matching fashion products found."
+            },
+            "search_mode": "image",
+            "is_out_of_domain": is_out_of_domain,
+            "out_of_domain_reason": domain_reason,
+            "detected_entity": det_res.get("detected_entity"),
+            "total_found": 0,
+            "query_image_url": f"/media/uploads/{raw_filename}",
+            "crop_image_url": f"/media/crops/{crop_filename}",
+            "detected_boxes": det_res["detected_boxes"],
+            "crop_applied": det_res["crop_applied"],
+            "crop_box": det_res["crop_box"],
+            "dimensions": det_res["dimensions"],
+            "latency_sec": elapsed
+        }
+
+    # 4. Optional rank gap noise elimination
+    if eliminate_noise and len(final_results) > 0:
+        from search_engine.scoring import eliminate_rank_gap_noise
+        filtered_results, noise_meta = eliminate_rank_gap_noise(
+            ranked_items=final_results,
+            gap_threshold=gap_threshold,
+            min_confidence_ratio=0.50,
+            max_results=max_results,
+            search_mode="image"
+        )
+        for idx, itm in enumerate(filtered_results):
+            itm["rank"] = idx + 1
+    else:
+        filtered_results = final_results[:max_results]
+        noise_meta = {
+            "total_candidates": len(final_results),
+            "kept_count": len(filtered_results),
+            "eliminated_count": 0,
+            "gap_detected": False
+        }
+
+    return {
+        "results": filtered_results,
+        "noise_metadata": noise_meta,
+        "search_mode": "image",
+        "total_found": len(filtered_results),
+        "is_out_of_domain": False,
+        "query_image_url": f"/media/uploads/{raw_filename}",
+        "crop_image_url": f"/media/crops/{crop_filename}",
+        "detected_boxes": det_res["detected_boxes"],
+        "crop_applied": det_res["crop_applied"],
+        "crop_box": det_res["crop_box"],
+        "dimensions": det_res["dimensions"],
+        "detected_entity": det_res.get("detected_entity"),
+        "latency_sec": elapsed
+    }
 
 
 indexing_in_progress = False

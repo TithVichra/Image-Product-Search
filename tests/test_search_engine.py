@@ -7,7 +7,7 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from search_engine.chunking import chunk_product_description
-from search_engine.scoring import compute_dot_product, blend_scores, eliminate_rank_gap_noise
+from search_engine.scoring import compute_dot_product, blend_scores, eliminate_rank_gap_noise, calibrate_cross_modal
 
 
 class TestChunkingAndScoring(unittest.TestCase):
@@ -43,15 +43,15 @@ class TestChunkingAndScoring(unittest.TestCase):
         dot = compute_dot_product(u, v)
         self.assertAlmostEqual(dot, 0.8, places=4)
 
-        # Mode: image (75% image, 25% text)
+        # Mode: image (75% image, 25% calibrated text)
         img_score = 0.90
         txt_score = 0.40
         score_img_mode = blend_scores(img_score, txt_score, search_mode="image")
-        self.assertAlmostEqual(score_img_mode, 0.75 * 0.90 + 0.25 * 0.40, places=4)
+        self.assertAlmostEqual(score_img_mode, 0.75 * img_score + 0.25 * calibrate_cross_modal(txt_score), places=4)
 
-        # Mode: text (75% text, 25% image)
+        # Mode: text (75% text, 25% calibrated image)
         score_txt_mode = blend_scores(img_score, txt_score, search_mode="text")
-        self.assertAlmostEqual(score_txt_mode, 0.75 * 0.40 + 0.25 * 0.90, places=4)
+        self.assertAlmostEqual(score_txt_mode, 0.75 * txt_score + 0.25 * calibrate_cross_modal(img_score), places=4)
         print(f"\n[Test] Blend scores: Image mode={score_img_mode}, Text mode={score_txt_mode}")
 
     def test_rank_gap_noise_elimination(self):

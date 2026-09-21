@@ -173,15 +173,16 @@ class CLIPService:
         (e.g., dog, cat, animal, vehicle, food, landscape) using CLIP zero-shot classification.
         """
         domain_labels = [
-            ("fashion", "a photo of a wearable fashion apparel clothing dress shirt pants shoes footwear or fashion accessory product"),
-            ("sports_equipment", "a photo of a sports equipment ball soccer ball football basketball tennis ball or athletic equipment"),
-            ("animal", "a photo of an animal pet dog cat puppy kitten or wildlife"),
-            ("vehicle", "a photo of a vehicle car motorcycle truck bus or bicycle"),
-            ("food", "a photo of food meal dish or edible item"),
-            ("other", "a photo of household furniture electronics landscape or room interior")
+            ("fashion", "a photo of wearable fashion clothing, apparel, shirts, t-shirts, tops, dresses, skirts, jeans, trousers, shorts, jackets, sweaters, shoes, sports shoes, sneakers, sandals, watches, bags, backpacks, wallets, sunglasses, or accessories"),
+            ("sports_ball", "a photo of a sports ball, soccer ball, football, basketball, baseball, tennis ball, or golf ball"),
+            ("animal", "a photo of an animal, pet, dog, cat, puppy, kitten, bird, wildlife, or mammal"),
+            ("vehicle", "a photo of a vehicle, car, motorcycle, truck, bus, or bicycle"),
+            ("food", "a photo of food, cooked meal, burger, pizza, salad, fruit, or edible dish"),
+            ("other", "a photo of household furniture, electronics, landscape, or room interior")
         ]
 
-        if not hasattr(self, "_domain_text_vectors") or self._domain_text_vectors is None:
+        # Reset cache if labels changed
+        if not hasattr(self, "_domain_text_vectors") or self._domain_text_vectors is None or len(self._domain_text_vectors) != len(domain_labels):
             texts = [label_desc for _, label_desc in domain_labels]
             self._domain_text_vectors = self.encode_texts(texts)
 
@@ -200,11 +201,11 @@ class CLIPService:
         top_prob = float(probs[top_idx])
         fashion_prob = domain_probs["fashion"]
 
-        # Out of domain if animal/sports_equipment/vehicle/food/other dominates over fashion or fashion < 35%
+        # Only out-of-domain if non-fashion class dominates with high confidence
         is_out_of_domain = False
         out_of_domain_reason = None
 
-        if top_domain != "fashion" or fashion_prob < 0.35:
+        if top_domain in ["sports_ball", "animal", "vehicle", "food"] and top_prob >= 0.50 and fashion_prob < 0.25:
             is_out_of_domain = True
             domain_name = top_domain.replace("_", " ")
             out_of_domain_reason = f"Image classified as {domain_name} ({top_prob*100:.1f}%) rather than fashion product ({fashion_prob*100:.1f}%)"
@@ -214,6 +215,7 @@ class CLIPService:
             "top_domain": top_domain,
             "top_confidence": round(top_prob, 3),
             "fashion_probability": round(fashion_prob, 3),
+            "domain_probs": domain_probs,
             "domain_probabilities": {k: round(v, 3) for k, v in domain_probs.items()},
             "out_of_domain_reason": out_of_domain_reason
         }
